@@ -60,15 +60,19 @@ class RotamerFeaturizer(object):
         # we need the first trajectory so we can call all_rotamers and get
         # atom_inds and rotamer_n_states
         first_trj = next(trj_iter)
+        print("Loaded first_trj"+str(trj_iter))
         rotamer_trj, atom_inds, rotamer_n_states = geometry.all_rotamers(
             first_trj, buffer_width=self.buffer_width)
+        print("Obtained all rotamers and atom_inds")
 
         # build the list of all of the rotamerized trajectories, starting
         # with the one we just calculated above.
         rotamer_trajs = [rotamer_trj]
+        print("Defined the new rotamer_trajs list")
         rotamer_trajs.extend(
             [geometry.all_rotamers(t, buffer_width=self.buffer_width)[0]
              for t in trj_iter])
+        print("Obtained all trajectories")
 
         self.feature_trajectories_ = rotamer_trajs
         self.n_feature_states_ = rotamer_n_states
