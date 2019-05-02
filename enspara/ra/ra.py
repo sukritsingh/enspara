@@ -42,8 +42,55 @@ def where(mask):
         return np.where(mask)
 
 
-def save(output_name, ragged_array):
+def save(filename, array, compression_level=1, tag='arr'):
     """Save a RaggedArray or numpy ndarray to disk as an HDF5 file.
+     Parameters
+    ----------
+    filename : str
+        Path of file to write out (per tables.open_file).
+    array : np.ndarray, RaggedArray
+        Array to write to disk.
+    compression_level : int
+        Level of compression to use, 0-9, with 0 meaning no compression.
+        Per the pytables Filters complevel flag.
+    tag : str, default='array'
+        The name under which each row in the ragged array will be saved,
+        for example 'array_00'.
+    """
+
+    try:
+        n_zeros = len(str(len(array.lengths))) + 1
+    except AttributeError:
+        n_zeros = 1
+        array = [array]
+
+    compression = tables.Filters(
+        complevel=compression_level,
+        complib='zlib',
+        shuffle=True)
+
+    with tables.open_file(filename, 'w') as handle:
+        for i in range(len(array)):
+            subarr = array[i]
+
+            if hasattr(array, '_data'):
+                atom = tables.Atom.from_dtype(array._data.dtype)
+            else:
+                atom = tables.Atom.from_dtype(subarr.dtype)
+
+            t = tag + '_' + str(i).zfill(n_zeros)
+
+            node = handle.create_carray(
+                where='/', name=t, atom=atom,
+                shape=subarr.shape, filters=compression)
+
+            node[:] = subarr
+
+    return filename
+
+
+def _save_old_style(output_name, ragged_array):
+    """Depricated en bloc RaggedArray saving routine.
 
     Parameters
     ----------
@@ -67,7 +114,7 @@ def save(output_name, ragged_array):
         io.saveh(output_name, ragged_array)
 
 
-def load(input_name, keys=None):
+def load(input_name, keys=..., stride=1):
     """Load a RaggedArray from the disk. If only 'arr_0' is present in
     the target file, a numpy array is loaded instead.
 
@@ -75,10 +122,15 @@ def load(input_name, keys=None):
     ----------
     input_name: filename or file handle
         File from which data will be loaded.
-    keys : list, default=None
+    keys : list, default=...
         If this option is specified, the ragged array is built from this
         list of keys, each of which are assumed to be a row of the final
         ragged array. An ellipsis can be provided to indicate all keys.
+    stride: int, default=1
+        This option specifies a stride in the second dimension of the
+        loaded ragged array. This is equivalent to slicing out
+        [:, ::stride], except that it does not load the entire dataset
+        into memory.
 
     Returns
     -------
@@ -89,14 +141,23 @@ def load(input_name, keys=None):
     with tables.open_file(input_name) as handle:
         if keys is None:
             if '/lengths' in handle:
-                return RaggedArray(
-                    handle.get_node('/array')[:],
+                a = RaggedArray(
+                    handle.get_node('/array'),
                     lengths=handle.get_node('/lengths'))
+                return a[::stride]
             else:
-                return handle.get_node('/arr_0')[:]
+                return handle.get_node('/arr_0')[::stride]
         else:
             if keys is Ellipsis:
                 keys = [k.name for k in handle.list_nodes('/')]
+            if '/lengths' in handle and '/array' in handle:
+                warnings.warn("Found keys '/lengths' and '/array' in h5 "
+                              "file %s, are you sure this isn't an "
+                              "old-style h5?", input_name)
+            if len(keys) == 1:
+                logger.debug("Found only one key ('%s') returning that as "
+                             "numpy array", keys[0])
+                return handle.get_node('/' + keys[0])[:]
 
             logger.debug('Loading keys %s into RA', keys)
 
@@ -116,11 +177,9 @@ def load(input_name, keys=None):
                         " Dimension  %s didn't match. Got shapes: %s"
                         % (dim, shapes))
 
-            lengths = [shape[0] for shape in shapes]
-            first_shape = shapes[0]
+            lengths = [(shape[0] + stride - 1) // stride for shape in shapes]
+            concat_shape = (sum(lengths),) + (shapes[0][1:])
 
-            concat_shape = list(first_shape)
-            concat_shape[0] = sum(lengths)
             dtype = handle.get_node(where='/', name=keys[0]).dtype
             if not all([dtype == handle.get_node(where='/', name=k).dtype
                         for k in keys]):
@@ -133,25 +192,26 @@ def load(input_name, keys=None):
             concat = np.zeros(concat_shape, dtype=dtype)
             tock = time.perf_counter()
             logger.debug('Allocated %.3f MB in %.2f min.',
-                         concat.data.nbytes / 1024**2, tock-tick)
+                         concat.data.nbytes / 1024**2, tock - tick)
 
             logger.debug(
                 'Filling array with %s blocks with initial memory '
                 'footprint of %.3f GB',
                 len(keys),
                 resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2)
+
             tick = time.perf_counter()
             start = 0
             for key in keys:
-                node = handle.get_node(where='/', name=key)
+                node = handle.get_node(where='/', name=key)[::stride]
                 end = start + len(node)
-                node.read(out=concat[start:end])
+                concat[start:end] = node
                 start = end
 
             tock = time.perf_counter()
             logger.debug(
                 'Filled RaggedArray in %.3f min with %.3f GB memory overhead.',
-                (tock-tick) / 60,
+                (tock - tick) / 60,
                 resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2)
             tick = time.perf_counter()
 
@@ -482,8 +542,13 @@ class RaggedArray(object):
             self._array = []
         # rebuild array from 1d and lengths
         else:
-            self._array = np.array(
-                partition_list(self._data, lengths), dtype='O')
+            try:
+                self._array = np.array(
+                    partition_list(self._data, lengths), dtype='O')
+            except DataInvalid:
+                raise DataInvalid(
+                    "Sum of lengths (%s) didn't match data shape (%s)." %
+                    (sum(lengths), self._data.shape))
             self.lengths = np.array(lengths)
 
     @property
